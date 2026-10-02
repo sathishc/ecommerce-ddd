@@ -204,10 +204,43 @@ application/               command_handlers.py (Command → UoW → Events),
 infra/                     blocks.py, clock.py, event_bus.py, repositories.py,
                            unit_of_work.py, command_bus.py, handlers.py,
                            container.py
+api/                       CQRS HTTP layer (stdlib only): server.py (routes),
+                           command_adapter.py (JSON → Command), queries.py
+                           (read-models), serializers.py, seed.py (demo data)
+web/                       React + Vite demo frontend (commands vs queries split
+                           in src/cqrs/); proxies /api to the backend in dev
 tests/                     test_aggregates, test_happy_path, test_returns,
-                           test_commands, test_infra_blocks, conftest
+                           test_commands, test_infra_blocks, test_api, conftest
 pytest.ini / .gitignore
 ```
+
+## API + frontend (CQRS demo)
+
+The backend exposes the domain over HTTP with a strict CQRS split — same
+`Container`/`CommandBus` as the tests, no new dependencies (stdlib
+`http.server` only):
+
+- **Writes:** `POST /api/commands` with `{"type": "AddToCart", "payload": {...}}`
+  — one domain `Command` → exactly one handler → one atomic UoW. Returns the
+  resulting DTO plus the events committed by that UoW.
+- **Reads:** `GET /api/products`, `/api/carts/:id`, `/api/orders`,
+  `/api/orders/:id/payment`, `/api/shipments`, `/api/returns`, `/api/pickups`,
+  `/api/stocks`, `/api/coupons`, `/api/dashboard`, `/api/events` — pure
+  `api/queries.py` over the repositories; never mutate, never open a UoW.
+- Errors: domain violations → 422, missing aggregates → 404, unknown
+  commands → 400.
+
+```bash
+python3 -m api.server --port 8000 --seed   # backend + demo catalog/coupons
+cd web && npm install && npm run dev       # React frontend on :5173 (/api proxied)
+```
+
+`web/src/cqrs/` mirrors the split: `commands.js` (all mutations as dispatched
+intents) vs `queries.js` (all reads as GETs, re-fetched after each command).
+Four tabs walk the whole model: **Shop** (catalog → cart → coupon → PlaceOrder),
+**Orders** (HandToCarrier = commit + capture, ConfirmDelivery, CancelOrder),
+**Returns** (RequestReturn → SchedulePickup → ConfirmPickup scan+photo →
+SettleReturn pro-rata), **Events** (committed event stream, polls every 3s).
 
 ## Assumptions (v1 locked)
 
