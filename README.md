@@ -1,4 +1,4 @@
-# Ecommerce Order Platform — Domain + Application + Infra (Python, DDD)
+# Ecommerce Order Platform — DDD Backend + CQRS API + React Frontend
 
 Single-seller shop for physical products. Stock is reserved at order time.
 Payment is **authorize at placement, capture at shipment**. Returns are
@@ -8,7 +8,9 @@ customer-initiated and collected via **doorstep courier pickup**. Discounts are
 This repo is a clean DDD implementation in Python: aggregates own their
 invariants, application services / command handlers cross bounded contexts
 inside one atomic Unit-of-Work, and infra follows a local-first Blocks
-philosophy (same code runs locally or on AWS).
+philosophy (same code runs locally or on AWS). On top sits a stdlib-only
+CQRS HTTP API (`api/`) and a React demo frontend (`web/`) that walks the
+full order + return flows through commands (writes) and queries (reads).
 
 Full ubiquitous language, context map, and invariants live in
 [`domain-model.md`](./domain-model.md) (v1 locked).
@@ -23,7 +25,11 @@ application/     Orchestration across contexts. Command handlers (one per
 infra/           Technical adapters: repositories, Unit-of-Work, CommandBus,
                  EventBus, Clock, local-first Blocks (KVStore/Table/S3/SES/
                  SSM/CloudWatch/X-Ray/SQS ports), DI container.
-tests/           87 tests: aggregates, happy path, returns, commands, infra.
+api/             CQRS HTTP layer (stdlib only): JSON → Command writes on
+                 POST /api/commands, repository read-models on GET /api/….
+web/             React + Vite demo frontend; src/cqrs/ splits commands.js
+                 (writes) from queries.js (reads).
+tests/           94 tests: aggregates, happy path, returns, commands, infra, api.
 ```
 
 Dependency rule: `domain` ← `application` ← `infra`. Domain never imports
@@ -111,7 +117,8 @@ commands, since no external actor initiates them.
 
 ## Getting started
 
-Requires Python 3.10+ (tested on 3.14), no third-party dependencies.
+Backend: Python 3.10+ (tested on 3.14), no third-party dependencies.
+Frontend (`web/`): Node 18+ and npm.
 
 ```bash
 git clone <this-repo> && cd ecommerce-domain
@@ -121,9 +128,24 @@ python3 -m pytest -q
 `pytest.ini` sets `pythonpath = .` and `testpaths = tests`.
 
 ```bash
-python3 -m pytest -q                        # all 87 tests
+python3 -m pytest -q                        # all 94 tests
+python3 -m pytest tests/test_api.py -q      # API layer only (7 tests)
 BLOCKS_BACKEND=local python3 -m pytest tests/test_infra_blocks.py -q
 ```
+
+### Run the demo (backend + frontend)
+
+```bash
+python3 -m api.server --port 8000 --seed   # backend + demo catalog/coupons
+cd web && npm install && npm run dev       # React frontend on :5173 (/api proxied)
+```
+
+Open http://localhost:5173. The Shop tab walks `OpenCart → AddToCart →
+ApplyCoupon → PlaceOrder`; Orders covers `HandToCarrier` (commit + capture),
+`ConfirmDelivery`, and `CancelOrder`; Returns covers `RequestReturn →
+SchedulePickup → ConfirmPickup` (scan + photo) `→ SettleReturn` (pro-rata);
+Events shows the committed event stream. State is in-memory — restarting the
+backend resets the demo (re-seed with `POST /api/seed` or `--seed`).
 
 ## Usage
 
@@ -223,24 +245,86 @@ The backend exposes the domain over HTTP with a strict CQRS split — same
 - **Writes:** `POST /api/commands` with `{"type": "AddToCart", "payload": {...}}`
   — one domain `Command` → exactly one handler → one atomic UoW. Returns the
   resulting DTO plus the events committed by that UoW.
-- **Reads:** `GET /api/products`, `/api/carts/:id`, `/api/orders`,
-  `/api/orders/:id/payment`, `/api/shipments`, `/api/returns`, `/api/pickups`,
-  `/api/stocks`, `/api/coupons`, `/api/dashboard`, `/api/events` — pure
-  `api/queries.py` over the repositories; never mutate, never open a UoW.
-- Errors: domain violations → 422, missing aggregates → 404, unknown
-  commands → 400.
+- **Reads:** pure `api/queries.py` over the repositories; never mutate, never
+  open a UoW.
+- Errors are JSON envelopes: domain violations → 422 (`{"ok": false, "kind":
+  "domain", ...}`), missing aggregates → 404 (`"kind": "not_found"`), unknown
+  commands → 400 (`"kind": "bad_request"`).
+
+### Write endpoint
+
+`POST /api/commands` accepts all 17 user intents (`GET /api/commands` lists
+them): `PublishProduct`, `OpenCart`, `AddToCart`, `UpdateCartLine`,
+`RemoveCartLine`, `ApplyCoupon`, `RemoveCoupon`, `PlaceOrder`, `CancelOrder`,
+`CloseCart`, `HandToCarrier`, `ConfirmDelivery`, `RequestReturn`,
+`RejectReturn`, `SchedulePickup`, `ConfirmPickup`, `SettleReturn`.
+
+### Read endpoints
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/dashboard` | counts, orders-by-status, revenue read-model |
+| `GET /api/products` (+ `/:id`) | catalog with `Money` as `{minor, currency, display}` |
+| `GET /api/stocks` | availability + reserved per product (with product names) |
+| `GET /api/coupons` | code, type, window, usage, redemptions |
+| `GET /api/carts` (+ `/:id`) | lines + derived `quote` (subtotal − discount + tax + shipping) |
+| `GET /api/orders` (+ `/:id`) | frozen totals, status, lines, coupon, payment ref |
+| `GET /api/orders/:id/payment` | payment status + accrued refunds |
+| `GET /api/shipments` (+ `/:id`) | carrier, tracking, scans |
+| `GET /api/returns` (+ `/:id`) | RMA lines, status, pro-rata settlement once settled |
+| `GET /api/pickups` (+ `/:id`) | courier slot, status, photo evidence |
+| `GET /api/events?limit=N` | committed domain-event stream (transactional outbox), newest last |
+| `POST /api/seed` | (re)seed demo data, idempotent |
+
+### curl walkthrough (happy path)
 
 ```bash
-python3 -m api.server --port 8000 --seed   # backend + demo catalog/coupons
-cd web && npm install && npm run dev       # React frontend on :5173 (/api proxied)
+B=localhost:8000
+CART=$(curl -s -X POST $B/api/commands -H 'Content-Type: application/json' \
+  -d '{"type":"OpenCart","payload":{"customer_ref":"demo-1"}}' |
+  python3 -c "import sys,json; print(json.load(sys.stdin)['result']['cart']['cart_id'])")
+P1=$(curl -s $B/api/products |
+  python3 -c "import sys,json; print(json.load(sys.stdin)['products'][0]['product_id'])")
+curl -s -X POST $B/api/commands -H 'Content-Type: application/json' \
+  -d "{\"type\":\"AddToCart\",\"payload\":{\"cart_id\":\"$CART\",\"product_id\":\"$P1\",\"quantity\":2}}"
+curl -s -X POST $B/api/commands -H 'Content-Type: application/json' \
+  -d "{\"type\":\"ApplyCoupon\",\"payload\":{\"cart_id\":\"$CART\",\"coupon_code\":\"SAVE20\"}}"
+ORD=$(curl -s -X POST $B/api/commands -H 'Content-Type: application/json' -d \
+  "{\"type\":\"PlaceOrder\",\"payload\":{\"cart_id\":\"$CART\",\"instrument_ref\":\"card-1\",\
+  \"destination\":{\"line1\":\"1 Main St\",\"city\":\"Springfield\",\"postal_code\":\"12345\",\"country\":\"US\"}}}" |
+  python3 -c "import sys,json; print(json.load(sys.stdin)['result']['order']['order_id'])")
+curl -s -X POST $B/api/commands -H 'Content-Type: application/json' \
+  -d "{\"type\":\"HandToCarrier\",\"payload\":{\"order_id\":\"$ORD\",\"carrier\":\"UPS\",\"tracking_number\":\"TRK-1\"}}"
+SHP=$(curl -s $B/api/shipments |
+  python3 -c "import sys,json; print(json.load(sys.stdin)['shipments'][0]['shipment_id'])")
+curl -s -X POST $B/api/commands -H 'Content-Type: application/json' \
+  -d "{\"type\":\"ConfirmDelivery\",\"payload\":{\"shipment_id\":\"$SHP\",\"order_id\":\"$ORD\"}}"
+curl -s $B/api/orders/$ORD   # Delivered · frozen total · payment Captured
 ```
 
-`web/src/cqrs/` mirrors the split: `commands.js` (all mutations as dispatched
-intents) vs `queries.js` (all reads as GETs, re-fetched after each command).
-Four tabs walk the whole model: **Shop** (catalog → cart → coupon → PlaceOrder),
-**Orders** (HandToCarrier = commit + capture, ConfirmDelivery, CancelOrder),
-**Returns** (RequestReturn → SchedulePickup → ConfirmPickup scan+photo →
-SettleReturn pro-rata), **Events** (committed event stream, polls every 3s).
+Return path from there: `RequestReturn` (lines as `[[product_id, qty]]`) →
+`SchedulePickup` (ISO `slot`) → `ConfirmPickup` (`evidence.photo_ref`) →
+`SettleReturn` (pro-rata `goods + tax + shipping` breakdown).
+
+### Seed data (`--seed` / `POST /api/seed`)
+
+4 products (Gadget Pro $100, Gadget Mini $50, Braided Cable $14.99, Desk
+Stand $29.99) with stock, plus coupons `SAVE20` (20% off), `FLAT5` ($5 off),
+`FREESHIP` (free shipping).
+
+### Frontend (`web/`)
+
+React 18 + Vite. `src/cqrs/` mirrors the backend split: `commands.js` (all
+mutations as dispatched intents) vs `queries.js` (all reads as GETs,
+re-fetched after each command). Vite proxies `/api` → `127.0.0.1:8000` in
+dev (`npm run dev`, :5173); `npm run build` produces a static `dist/`.
+
+| Tab | Demonstrates |
+|---|---|
+| **Shop** | catalog query → `OpenCart` → `AddToCart` → `ApplyCoupon` → live quote → `PlaceOrder` (authorize, not capture) |
+| **Orders** | order read-models + payment status; `HandToCarrier` (commit + capture), `ConfirmDelivery` (opens return window), `CancelOrder` (void + release, pre-shipment only) |
+| **Returns** | `RequestReturn` (Delivered-only picklist) → `SchedulePickup` → `ConfirmPickup` (scan + photo) → `SettleReturn` with goods/tax/shipping breakdown |
+| **Events** | committed event stream, polls every 3s — the Notification-context view |
 
 ## Assumptions (v1 locked)
 
