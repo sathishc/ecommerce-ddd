@@ -1,21 +1,31 @@
-"""Returns context — the Return (RMA) aggregate.
+"""Returns bounded context — the Return (RMA) aggregate.
 
-Customer-initiated only: a customer requests, staff approve/reject, the
-platform's courier collects at the door (Fulfillment's Pickup), and the
-settlement drives refund + restock + (on a complete return) coupon re-entitlement.
+Responsibility:
+    Own the customer-initiated return of delivered goods collected via
+    doorstep pickup: request validation (window + quantities), approval,
+    pickup linkage, possession-transfer gating, and the pro-rata refund
+    settlement that drives Payment refund + Inventory restock + Order
+    finalization (+ coupon re-entitlement on a complete return).
 
-Invariants:
-  RT1  may be opened only against a Delivered order, within the return
-       window (30 days from delivery, configurable)
-  RT2  returnLines qty <= the shipped qty for each product (no over-returning)
-  RT3  refund amount is pro-rata: goods + tax + shipping all scale with the
-       fraction of the order's line value that is returned (see _compute_refund)
-  RT4  Refunded is terminal
-  RT5  goods are collected at the customer's door via a Pickup; only after the
-       courier actually has them (PickupConfirmed, PK5 evidence) is settlement
-       and Inventory restock allowed
-  RT6  a COMPLETE return triggers Coupon.unredeem (customer regains the code);
-       a PARTIAL return keeps the redemption burned
+Lifecycle / state machine (RT4/RT5)::
+
+    Requested --approve()--> Approved --link_pickup()--> PickupScheduled
+        |                         |                            |
+        +------reject()-----+-----+----reject()----------------+--reject()--+
+        |                   |     (rejection only before       |            |
+        |                   |      goods are collected, RT4)    v            v
+        |                   |                      PickedUp --receive_goods()--> GoodsReceived --settle()--> Refunded (terminal)
+        |                   |                      (via on_pickup_confirmed, PK3/RT5)
+        v                   v
+      Rejected (terminal) Rejected (terminal)                              Rejected impossible after pickup
+
+    Customer-initiated only: staff may approve/reject, but only a customer
+    opens an RMA (RT1). The customer does NOT ship back — the platform's
+    courier collects at the door; the courier's on-site scan + photo is the
+    possession-transfer event (PickedUp) that gates settlement and restock
+    (RT5/S4). Refund math is pro-rata (RT3, model §5): goods + tax +
+    shipping all scale with the fraction of the order's line value returned;
+    a full return refunds the full shipping fee. Pickup itself is free.
 """
 from __future__ import annotations
 
@@ -38,7 +48,19 @@ DEFAULT_WINDOW_DAYS = 30  # RT1 (assumed 30 days from delivery, configurable)
 
 @dataclass(frozen=True)
 class ReturnLine:
-    """Child of Return: a product + quantity to return."""
+    """Child entity of Return: one product + quantity to return.
+
+    Role:
+        The customer-requested return quantity for one shipped product.
+
+    Members:
+        product_id: Product to take back.
+        quantity: Units to take back (>= 1; <= shipped qty per RT2).
+
+    Invariants:
+        RT2: quantity >= 1 and <= the original shipped qty for that product
+            (no over-returning); enforced in ``Return.__init__``.
+    """
 
     product_id: str
     quantity: int
@@ -46,8 +68,29 @@ class ReturnLine:
 
 @dataclass(frozen=True)
 class _OrderFacts:
-    """Snapshot of the delivered order taken at request time (ACL from Order Mgmt):
-    everything RT1/RT3 need, frozen so later catalog changes cannot alter the math."""
+    """Snapshot of the delivered order taken at request time (ACL from Order Mgmt).
+
+    Role:
+        Freeze everything RT1/RT3 need — order identity, shipped lines with
+        unit prices, discount, shipping fee, tax rate, delivery date — so
+        later catalog or order changes cannot alter return validation or the
+        pro-rata refund math.
+
+    Members:
+        order_id: Delivered order under return.
+        customer_id: Customer who owns the order (coupon re-entitlement key).
+        destination: Doorstep where the Pickup collects (Fulfillment link).
+        shipped_lines: (product_id, qty, unit_price) tuples; RT2 bounds and
+            the RT3 originalLineSubtotal denominator come from these.
+        discount: Frozen coupon discount (Money; RT3 discount-share numerator).
+        shipping_fee: Frozen shipping fee (Money; RT3 shipping-refund base).
+        tax_num/tax_den: Tax fraction (v1: 0/100, pluggable).
+        delivered_at: Delivery date (RT1 window anchor).
+
+    Invariants:
+        RT1: delivered_at must be set (order must be Delivered).
+        RT3: shipped line subtotal must be positive (division denominator).
+    """
 
     order_id: str
     customer_id: str
@@ -61,13 +104,71 @@ class _OrderFacts:
 
 
 class Return(Aggregate):
-    """Aggregate root (identity = rma_id): one customer return against an order."""
+    """Aggregate root (identity = rma_id): one customer return against an order.
+
+    Role:
+        Validate the return window and quantities, link the Fulfillment
+        Pickup that collects the goods, gate settlement on physical
+        possession, then compute the pro-rata refund the orchestration layer
+        applies across contexts.
+
+    Members:
+        _facts: Frozen _OrderFacts snapshot (RT1/RT3 source of truth).
+        _lines: ReturnLine list (RT2-validated).
+        _reason: Customer's return reason.
+        _requested_at: Request timestamp (RT1 window check endpoint).
+        _window_days: Return window in days (RT1; default 30, configurable).
+        _pickup_id: Linked Pickup id (None until ``link_pickup``).
+        _evidence: Collection evidence from ``on_pickup_confirmed`` (PK5).
+        _settlement: RefundBreakdown computed by ``settle`` (RT3).
+        _status: Requested | Approved | PickupScheduled | PickedUp |
+            GoodsReceived | Refunded (terminal) | Rejected (terminal).
+
+    Invariants:
+        RT1: opened only against a Delivered order, within the return window
+            (30 days from delivery, configurable).
+        RT2: returnLines qty <= shipped qty per product (no over-returning).
+        RT3: refund is pro-rata — goods + tax + shipping scale with the
+            returned fraction of line value (see ``_compute_refund``).
+        RT4: Refunded is terminal; rejection only before goods collected.
+        RT5: goods collected at the door via a Pickup; settlement and
+            restock only after the courier actually has them.
+        RT6: a COMPLETE return triggers Coupon.unredeem; a PARTIAL return
+            keeps the redemption burned.
+
+    State transitions:
+        __init__: (new) -> Requested.
+        approve: Requested -> Approved.
+        link_pickup: Approved -> PickupScheduled.
+        on_pickup_confirmed: PickupScheduled -> PickedUp.
+        receive_goods: PickedUp -> GoodsReceived.
+        settle: GoodsReceived -> Refunded (terminal).
+        reject: Requested/Approved/PickupScheduled -> Rejected (terminal).
+    """
 
     prefix = "rma"
 
     def __init__(self, facts: _OrderFacts, return_lines: list[tuple[str, int]],
                  reason: str, requested_at: datetime,
                  window_days: int = DEFAULT_WINDOW_DAYS) -> None:
+        """Open an RMA against a delivered order (RT1/RT2).
+
+        Args:
+            facts: Frozen order snapshot (shipped lines, prices, discount,
+                shipping, delivery date).
+            return_lines: (product_id, quantity) pairs requested back.
+            reason: Customer's return reason.
+            requested_at: Request timestamp (RT1 window endpoint).
+            window_days: Return window in days (RT1; default 30).
+
+        Raises:
+            InvariantViolation: RT2 if no lines, qty < 1, unknown product,
+                or qty exceeds shipped; RT1 if the order is not Delivered,
+                the request predates delivery, or the window lapsed.
+
+        Events:
+            ReturnRequested(rma_id, order_id).
+        """
         super().__init__()
         # RT2: quantity bounds (no over-returning)
         shipped = {pid: qty for pid, qty, _ in facts.shipped_lines}
@@ -104,39 +205,88 @@ class Return(Aggregate):
 
     # -- identity / read ----------------------------------------------------
     def aggregate_id(self) -> str:
+        """Return the aggregate identity (the RMA id).
+
+        Returns:
+            str: this return's unique id.
+        """
         return self._rma_id
 
     @property
     def rma_id(self) -> str:
+        """Return the RMA id.
+
+        Returns:
+            str: identity of this return.
+        """
         return self._rma_id
 
     @property
     def order_id(self) -> str:
+        """Return the delivered order under return.
+
+        Returns:
+            str: order id from the frozen facts.
+        """
         return self._facts.order_id
 
     @property
     def destination(self) -> Address:
+        """Return the doorstep where the Pickup collects.
+
+        Returns:
+            Address: delivery address snapshot (Fulfillment link).
+        """
         return self._facts.destination
 
     @property
     def customer_id(self) -> str:
+        """Return the owning customer id (coupon re-entitlement key, RT6).
+
+        Returns:
+            str: customer from the frozen facts.
+        """
         return self._facts.customer_id
 
     @property
     def status(self) -> str:
+        """Return the current RMA state (RT4/RT5).
+
+        Returns:
+            str: Requested | Approved | PickupScheduled | PickedUp |
+            GoodsReceived | Refunded | Rejected.
+        """
         return self._status
 
     @property
     def lines(self) -> list[ReturnLine]:
+        """Return a copy of the return lines (RT2-validated).
+
+        Returns:
+            list[ReturnLine]: requested-back lines.
+        """
         return list(self._lines)
 
     @property
     def settlement(self) -> RefundBreakdown | None:
+        """Return the computed refund breakdown, if settled (RT3).
+
+        Returns:
+            Optional[RefundBreakdown]: set by ``settle``; None before.
+        """
         return self._settlement
 
     @property
     def is_complete(self) -> bool:
-        """RT6: every shipped line returned in full."""
+        """Report whether every shipped line is returned in full (RT6).
+
+        A complete return triggers Coupon.unredeem (customer regains the
+        code) and flips the Order to Refunded; a partial return keeps the
+        redemption burned and leaves the Order Delivered.
+
+        Returns:
+            bool: True iff returned (product -> qty) exactly equals shipped.
+        """
         shipped = {pid: qty for pid, qty, _ in self._facts.shipped_lines}
         returned = {l.product_id: l.quantity for l in self._lines}
         return all(returned.get(pid) == qty for pid, qty in shipped.items()) and \
@@ -144,21 +294,58 @@ class Return(Aggregate):
 
     # -- state machine ---------------------------------------------------------
     def approve(self) -> None:
+        """Approve a requested RMA: Requested -> Approved.
+
+        Raises:
+            InvalidStateTransition: unless currently Requested.
+
+        Events:
+            ReturnApproved(rma_id).
+        """
         if self._status != REQUESTED:
             raise InvalidStateTransition(f"can only approve a Requested RMA, not {self._status}")
         self._status = APPROVED
         self.raise_event(ReturnApproved(self._rma_id))
 
     def link_pickup(self, pickup_id: str) -> None:
-        """The orchestration layer (Fulfillment) scheduled a Pickup for this RMA."""
+        """Link the Fulfillment Pickup scheduled for this RMA (PK1).
+
+        The orchestration layer creates the Pickup, assigns a courier, then
+        calls this to bind the two aggregates.
+
+        Args:
+            pickup_id: Pickup collecting this RMA's goods.
+
+        Raises:
+            InvalidStateTransition: unless currently Approved.
+
+        Events:
+            None (PickupScheduled is owned by the Pickup aggregate).
+        """
         if self._status != APPROVED:
             raise InvalidStateTransition(f"pickup links to an Approved RMA, not {self._status}")
         self._pickup_id = pickup_id
         self._status = PICKUP_SCHEDULED
 
     def on_pickup_confirmed(self, pickup_id: str, evidence: PickupEvidence) -> None:
-        """PK3/RT5: the courier's on-site scan (with mandatory evidence) is the
-        possession-transfer event. Only this gates the subsequent settlement."""
+        """Record the courier's possession-transfer scan (PK3/RT5).
+
+        Only this gates the subsequent settlement: no pickup confirmation,
+        no refund/restock. The pickup id must match the linked pickup and
+        photo evidence is mandatory (PK5).
+
+        Args:
+            pickup_id: Confirming pickup (must equal the linked one).
+            evidence: Collection proof (photo_ref required).
+
+        Raises:
+            InvalidStateTransition: RT5 unless PickupScheduled with a
+                matching pickup id.
+            InvariantViolation: PK5 if evidence is missing or has no photo.
+
+        Events:
+            None (ReturnGoodsReceived fires in ``receive_goods``).
+        """
         if self._status != PICKUP_SCHEDULED or pickup_id != self._pickup_id:
             raise InvalidStateTransition(
                 f"RT5: pickup {pickup_id} does not match the linked pickup for this RMA")
@@ -168,15 +355,47 @@ class Return(Aggregate):
         self._status = PICKED_UP
 
     def receive_goods(self) -> None:
-        """Derived from PickupConfirmed (model: ReturnGoodsReceived)."""
+        """Reconcile the collected goods: PickedUp -> GoodsReceived (RT5).
+
+        Derived from PickupConfirmed (model: ReturnGoodsReceived). After
+        this, ``settle`` may compute the refund and orchestration may
+        restock Inventory (S4).
+
+        Raises:
+            InvalidStateTransition: RT5 unless currently PickedUp.
+
+        Events:
+            ReturnGoodsReceived(rma_id).
+        """
         if self._status != PICKED_UP:
             raise InvalidStateTransition(f"RT5: goods received only after PickedUp, not {self._status}")
         self._status = GOODS_RECEIVED
         self.raise_event(ReturnGoodsReceived(self._rma_id))
 
     def _compute_refund(self) -> RefundBreakdown:
-        """RT3 (model §5): goods + tax + shipping, all pro-rata to the returned
-        share of the order's line value. Round-half-up throughout."""
+        """Compute the pro-rata refund breakdown (RT3, model §5).
+
+        Pro-rata rule (round-half-up throughout)::
+
+            originalLineSubtotal  = Σ (originalQty x originalUnitPrice)
+            discountShare         = discount / originalLineSubtotal
+            returnedValue         = Σ (returnedQty x originalUnitPrice)
+            goodsRefund           = returnedValue x (1 - discountShare)
+            taxRefund             = goodsRefund x taxRate
+            shippingRefund        = shippingFee x returnedValue / originalLineSubtotal
+            totalRefund           = goodsRefund + taxRefund + shippingRefund
+
+        The customer's effective per-unit price stays identical to what they
+        paid (a 20%-off order returns 20% less); shipping scales with the
+        returned share (full fee on a full return; zero on free-shipping
+        orders without special-casing).
+
+        Returns:
+            RefundBreakdown: goods/tax/shipping/total + is_full flag (RT6).
+
+        Raises:
+            InvariantViolation: RT3 if the order line subtotal is not positive.
+        """
         f = self._facts
         original_line_subtotal = sum(
             qty * unit.minor for _, qty, unit in f.shipped_lines
@@ -208,11 +427,24 @@ class Return(Aggregate):
                                is_full=self.is_complete)
 
     def settle(self) -> RefundBreakdown:
-        """RT5/RT3/RT4: compute the pro-rata refund and finalize.
+        """Settle the return: GoodsReceived -> Refunded, terminal (RT5/RT3/RT4).
 
-        The caller (orchestration) then applies: Payment.refund(breakdown.total),
-        Stock.restock(...), Order.refund_completed(...), and — iff breakdown.is_full
-        — Coupon.unredeem (RT6)."""
+        Computes the RT3 pro-rata breakdown and finalizes the RMA. The
+        caller (orchestration) then applies it across contexts:
+        ``Payment.refund(breakdown.total)``, ``Stock.restock(...)``,
+        ``Order.refund_completed(...)`` (iff complete), and — iff
+        ``breakdown.is_full`` — ``Coupon.unredeem`` (RT6).
+
+        Returns:
+            RefundBreakdown: the computed goods/tax/shipping/total refund.
+
+        Raises:
+            InvalidStateTransition: RT5 unless GoodsReceived (goods must be
+                back before money moves).
+
+        Events:
+            ReturnRefunded(rma_id, total).
+        """
         if self._status != GOODS_RECEIVED:
             raise InvalidStateTransition(
                 f"RT5: settlement requires the goods to be back (GoodsReceived), not {self._status}")
@@ -222,7 +454,18 @@ class Return(Aggregate):
         return self._settlement
 
     def reject(self, reason: str) -> None:
-        """RT4: rejection is only possible before the goods are collected."""
+        """Reject the RMA before goods are collected (RT4).
+
+        Args:
+            reason: Staff rejection reason (surfaced on the event).
+
+        Raises:
+            InvalidStateTransition: RT4 unless Requested, Approved, or
+                PickupScheduled (never after pickup).
+
+        Events:
+            ReturnRejected(rma_id, reason).
+        """
         if self._status not in (REQUESTED, APPROVED, PICKUP_SCHEDULED):
             raise InvalidStateTransition(f"RT4: cannot reject a {self._status} RMA")
         self._status = REJECTED

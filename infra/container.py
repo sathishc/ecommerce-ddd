@@ -1,5 +1,19 @@
 """Composition root (DI container): the ONLY place concretes are chosen.
 
+Pattern implemented: Composition Root / Dependency Injection container. All
+wiring (which ``Clock``, which Blocks, which repos, which bus, which services,
+command-handler registration, Notification subscription) lives here -- and
+ONLY here. Application services receive ports (``UoWFactory``/``Clock``/Block
+ABCs) via constructor injection (DIP) and never import concretes, so swapping
+``BLOCKS_BACKEND=local|aws`` changes no application code (Blocks philosophy:
+same code, local or cloud).
+
+Atomicity/testability: the container owns the SHARED repositories and hands
+each UoW references to them (``uow_factory``), so one ``Container`` is one
+isolated "database"; ``build_test_container`` gives each test a fresh,
+deterministic world (``FixedClock`` + empty in-memory everything).
+
+
 ``build_container()`` wires the whole backend for local testing with zero
 AWS dependencies:
 
@@ -63,7 +77,14 @@ from infra.unit_of_work import InMemoryUnitOfWork, UnitOfWork, UoWFactory
 
 @dataclass
 class Container:
-    """Everything the application needs, injected (no globals, no singletons)."""
+    """Everything the application needs, injected (no globals, no singletons).
+
+    Holds Block ports (bus/mailer/logger/metrics/tracer/jobs/files/settings),
+    the Notification subscriber, the SHARED per-aggregate repositories (the
+    "database" for local runs -- every UoW from ``uow_factory`` aliases these
+    same objects), and the application services + command side built in
+    ``__post_init__``. One ``Container`` = one isolated backend.
+    """
 
     clock: Clock
     bus: EventBus
@@ -95,6 +116,14 @@ class Container:
     command_handlers: CommandHandlers | None = None
 
     def __post_init__(self) -> None:
+        """Build services + command side from the shared ports (wiring only).
+
+        Creates one ``UoWFactory`` bound to the shared repos (``uow_factory``),
+        injects it into the four app services, builds a fresh ``CommandBus``,
+        and registers all command handlers against that same factory. No
+        business logic here -- pure composition (adding a service = one line
+        here + one field above).
+        """
         factory: UoWFactory = self.uow_factory
         self.checkout = CheckoutAppService(factory, self.clock, self.tracer, self.jobs)
         self.shipping = ShippingAppService(factory, self.tracer)
@@ -107,7 +136,14 @@ class Container:
         self.uow_factory_fn = factory
 
     def uow_factory(self) -> UnitOfWork:
-        """Fresh UoW over the SHARED repos (atomic per use, outbox via bus)."""
+        """Fresh UoW over the SHARED repos (atomic per use, outbox via bus).
+
+        Returns:
+            A new ``InMemoryUnitOfWork`` aliasing this container's shared
+            repositories and publishing commits through this container's
+            ``bus`` (transactional outbox). Each call is one independent
+            transaction with its own snapshot/outbox -- never shared.
+        """
         return InMemoryUnitOfWork(
             carts=self.carts,
             orders=self.orders,
@@ -131,11 +167,25 @@ def build_container(
 ) -> Container:
     """Build a fully-wired container (DI composition root).
 
+    Selects Block backends by ``backend``/``BLOCKS_BACKEND`` (Blocks-style
+    conditional loading -- ``local`` = in-memory everything, ``aws`` = same
+    code against AWS Blocks), wires the shared EventBus + Notification
+    subscriber, seeds default settings, and returns the ready container.
+
     Args:
-        clock: time source (default SystemClock).
-        backend: ``local`` (default) or ``aws``; also honours BLOCKS_BACKEND.
-        settings_values: AppSetting overrides (e.g. return window days).
-        quiet_logger: False to also echo logs to stdout.
+        clock: Time source (default ``SystemClock`` for prod; tests pass a
+            ``FixedClock`` directly or use :func:`build_test_container`).
+        backend: ``"local"`` (default) or ``"aws"``; when None, honours the
+            ``BLOCKS_BACKEND`` env var. Anything else raises ``ValueError``.
+        settings_values: AppSetting overrides merged over defaults
+            (e.g. return window days) -- per-test config without env hacks.
+        quiet_logger: False to also echo logs to stdout (local debugging).
+
+    Returns:
+        A fully-wired ``Container`` with services + command bus ready.
+
+    Raises:
+        ValueError: If ``backend`` is neither ``"local"`` nor ``"aws"``.
     """
     import os
 
@@ -180,7 +230,21 @@ def build_container(
 
 
 def build_test_container(at: datetime | None = None, **kwargs) -> Container:
-    """Test container: frozen clock + isolated in-memory everything."""
+    """Test container: frozen clock + isolated in-memory everything.
+
+    Deterministic world for tests: a ``FixedClock`` (default 2026-09-28 noon,
+    overridable via ``at``), fresh in-memory Blocks/repos/bus per call, and
+    the Notification subscriber pre-registered -- no mocks, no AWS account.
+
+    Args:
+        at: Frozen instant for the ``FixedClock`` (defaults to 2026-09-28
+            12:00 so return-window math is stable across runs).
+        **kwargs: Forwarded to :func:`build_container` (e.g.
+            ``settings_values``, ``quiet_logger``).
+
+    Returns:
+        An isolated ``Container`` -- never shared between tests.
+    """
     from datetime import datetime as _dt
 
     return build_container(clock=FixedClock(at or _dt(2026, 9, 28, 12, 0)), **kwargs)

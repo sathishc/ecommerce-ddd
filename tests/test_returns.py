@@ -1,7 +1,16 @@
-"""The doorstep-return path:
-    RequestReturn -> Approve -> SchedulePickup -> ConfirmPickup(evidence)
-         -> SettleReturn -> PaymentRefunded + StockRestocked
-              (+ Order->Refunded, CouponUnredeemed  on a COMPLETE return)
+"""The doorstep-return path (orchestration services, via ``shop`` fixture).
+
+Scenario coverage: RequestReturn -> Approve -> SchedulePickup ->
+ConfirmPickup(evidence) -> SettleReturn -> PaymentRefunded + StockRestocked
+(+ Order->Refunded, CouponUnredeemed on a COMPLETE return). Locks RT3
+pro-rata math (goods + tax + shipping, half-up rounding) for full vs partial
+returns, RT6 coupon re-entitlement (full un-redeems, partial keeps burned),
+RT5/S4 restock-only-after-courier-possession, RT1 30-day window, RT2
+qty<=shipped, RT4 rejection, PK4 NoAccess attempts, PK5 photo evidence.
+
+Flows/invariants locked: RT1..RT6, PM4 (partial accrues vs full terminal),
+O3 (Refunded terminal / Delivered stays alive on partial), S4 (restock),
+CO7 (unredeem), PK2/PK4/PK5 (pickup lifecycle).
 """
 from __future__ import annotations
 
@@ -23,6 +32,16 @@ LATE = datetime(2026, 9, 29, 10, 0)
 
 
 def run_pickup(shop, rma, evidence=None) -> Pickup:
+    """Schedule a pickup 24h out and confirm it (doorstep possession transfer).
+
+    Args:
+        shop: The wired test shop.
+        rma: The approved return to pick up.
+        evidence: Photo evidence (defaults to photo+signature).
+
+    Returns:
+        The confirmed ``Pickup`` (PickedUp).
+    """
     evidence = evidence or PickupEvidence("photo-1.jpg", "sig-1.png")
     pickup = shop.returns.schedule_pickup(rma, datetime.now() + timedelta(hours=24))
     shop.returns.complete_pickup(rma, pickup, evidence)
@@ -30,15 +49,21 @@ def run_pickup(shop, rma, evidence=None) -> Pickup:
 
 
 def test_full_return_refunds_everything(shop):
+    """Behavior: full return refunds everything (125.00) across all contexts.
+
+    Invariants: RT3 (f==1 full pro-rata), O3 (Refunded terminal), PM4 (full
+    settlement), S4 (restocked to 10), RT6/CO7 (complete re-entitles coupon).
+    """
     cpn = shop.add_coupon()
     order, payment, _, _ = delivered_order(shop, coupon=cpn)
 
+    # Given a delivered order with coupon
     rma = shop.returns.request_return(
         order, [(shop.p1.product_id, 1), (shop.p2.product_id, 1)], "broken", LATE)
+    # When running pickup + settle (Then: RT3 pro-rata, full return f == 1 -- everything back)
     run_pickup(shop, rma)
     bd = shop.returns.settle(rma, order)
 
-    # RT3 pro-rata, full return (f == 1): everything back
     assert bd.is_full is True
     assert bd.total == money(125.00)          # goods 120 + tax 0 + shipping 5
     assert bd.goods == money(120.00)          # 150 - 30 (discount share) = 120
@@ -61,15 +86,20 @@ def test_full_return_refunds_everything(shop):
 
 
 def test_partial_return_keeps_coupon_burned(shop):
+    """Behavior: partial ($100/150) return refunds 83.33, order stays alive, coupon burned.
+
+    Invariants: RT3 (fraction 2/3 pro-rata), O3 (Delivered stays alive), PM4
+    (partial accrues Captured), RT6 (partial keeps coupon burned).
+    """
     cpn = shop.add_coupon()
     order, payment, _, _ = delivered_order(shop, coupon=cpn)
 
-    # return ONLY the $100 gadget, keep the $50 one
+    # Given a delivered order with coupon, When returning ONLY the $100 gadget:
     rma = shop.returns.request_return(order, [(shop.p1.product_id, 1)], "broken", LATE)
     run_pickup(shop, rma)
     bd = shop.returns.settle(rma, order)
 
-    # RT3: fraction = 100/150 = 2/3 of the order
+    # Then RT3: fraction = 100/150 = 2/3 of the order
     assert bd.is_full is False
     # goods = round(100 * (150 - 30)/150) = round(80.0) = 80.00
     assert bd.goods == money(80.00)
@@ -87,7 +117,11 @@ def test_partial_return_keeps_coupon_burned(shop):
 
 
 def test_pro_rata_math_round_half_up(shop):
-    """Verify the RT3 fraction math directly on the aggregate (no services)."""
+    """Behavior: RT3 fraction math (80.00 goods + 3.33 shipping) on the aggregate alone.
+
+    Invariants: RT3 (pro-rata + half-up rounding), exercised through the full
+    public state chain (approve->link->confirm->receive->settle), not bypassed.
+    """
     from domain.return_rma import Return, _OrderFacts
     facts = _OrderFacts(
         order_id="ord-x", customer_id="c1", destination=ADDRESS,
@@ -109,6 +143,7 @@ def test_pro_rata_math_round_half_up(shop):
 
 
 def test_return_window_30_days(shop):
+    """Behavior: request 31 days after delivery raises; Invariant: RT1 (30-day window)."""
     order, payment, _, _ = delivered_order(shop)
     # delivered 2026-09-28; request at 31 days -> out of window (RT1)
     too_late = datetime(2026, 10, 29, 10, 0)
@@ -117,6 +152,7 @@ def test_return_window_30_days(shop):
 
 
 def test_cannot_return_before_delivery(shop):
+    """Behavior: return on a Paid (not Delivered) order raises; Invariant: RT1 (Delivered only)."""
     cart = shop.build_cart()
     order, payment = shop.checkout.place_and_pay(cart, "card-1")
     with pytest.raises(DomainError, match="Delivered"):
@@ -124,6 +160,7 @@ def test_cannot_return_before_delivery(shop):
 
 
 def test_no_over_returning(shop):
+    """Behavior: requesting qty above shipped raises; Invariant: RT2 (qty <= shipped)."""
     order, payment, _, _ = delivered_order(shop)
     # only 1 was shipped; requesting 2 violates RT2
     with pytest.raises(InvariantViolation, match="exceeds shipped"):
@@ -131,7 +168,7 @@ def test_no_over_returning(shop):
 
 
 def test_restock_only_after_pickup_confirmed(shop):
-    """RT5/S4: the courier's on-site scan is the gate. No restock before it."""
+    """Behavior: settle before courier confirm raises, stock untouched; Invariants: RT5/S4."""
     order, payment, _, _ = delivered_order(shop)
     rma = shop.returns.request_return(order, [(shop.p1.product_id, 1)], "broken", LATE)
     pickup = shop.returns.schedule_pickup(rma, datetime.now() + timedelta(hours=24))
@@ -144,7 +181,7 @@ def test_restock_only_after_pickup_confirmed(shop):
 
 
 def test_pickup_requires_photo_evidence(shop):
-    """PK5: a doorstep pickup cannot be confirmed without captured proof."""
+    """Behavior: confirm with empty evidence raises photo error; Invariant: PK5."""
     order, payment, _, _ = delivered_order(shop)
     rma = shop.returns.request_return(order, [(shop.p1.product_id, 1)], "broken", LATE)
     pickup = shop.returns.schedule_pickup(rma, datetime.now() + timedelta(hours=24))
@@ -154,7 +191,7 @@ def test_pickup_requires_photo_evidence(shop):
 
 
 def test_no_access_reschedules_then_exhausts(shop):
-    """PK4: missed visits re-schedule up to N attempts, then flag manual."""
+    """Behavior: NoAccess reschedules to the limit, then raises exhausted; Invariant: PK4."""
     order, payment, _, _ = delivered_order(shop)
     rma = shop.returns.request_return(order, [(shop.p1.product_id, 1)], "broken", LATE)
     pickup = Pickup(rma.rma_id, ADDRESS, datetime.now() + timedelta(hours=24), max_attempts=2)
@@ -173,6 +210,7 @@ def test_no_access_reschedules_then_exhausts(shop):
 
 
 def test_reject_before_pickup(shop):
+    """Behavior: reject from Approved -> Rejected, stock untouched; Invariant: RT4."""
     order, payment, _, _ = delivered_order(shop)
     rma = shop.returns.request_return(order, [(shop.p1.product_id, 1)], "broken", LATE)
     # request_return already approved it (service shortcut); from Approved,
