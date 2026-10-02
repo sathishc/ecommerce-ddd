@@ -27,8 +27,9 @@ infra/           Technical adapters: repositories, Unit-of-Work, CommandBus,
                  SSM/CloudWatch/X-Ray/SQS ports), DI container.
 api/             CQRS HTTP layer (stdlib only): JSON → Command writes on
                  POST /api/commands, repository read-models on GET /api/….
-web/             React + Vite demo frontend; src/cqrs/ splits commands.js
-                 (writes) from queries.js (reads).
+web/             Northloop storefront (React + Vite + Tailwind);
+                 src/cqrs/ splits commands.js (writes) from queries.js
+                 (reads).
 tests/           94 tests: aggregates, happy path, returns, commands, infra, api.
 ```
 
@@ -140,12 +141,15 @@ python3 -m api.server --port 8000 --seed   # backend + demo catalog/coupons
 cd web && npm install && npm run dev       # React frontend on :5173 (/api proxied)
 ```
 
-Open http://localhost:5173. The Shop tab walks `OpenCart → AddToCart →
-ApplyCoupon → PlaceOrder`; Orders covers `HandToCarrier` (commit + capture),
-`ConfirmDelivery`, and `CancelOrder`; Returns covers `RequestReturn →
-SchedulePickup → ConfirmPickup` (scan + photo) `→ SettleReturn` (pro-rata);
-Events shows the committed event stream. State is in-memory — restarting the
-backend resets the demo (re-seed with `POST /api/seed` or `--seed`).
+Open http://localhost:5173 — a **Northloop Supply Co.** storefront: hero with
+live stats, searchable/sortable product grid, slide-over cart with coupon +
+checkout, **My orders** with delivery timelines and tracking, **Returns**
+with doorstep-pickup scheduling and pro-rata refund breakdowns, and a live
+activity feed. Warehouse/courier steps (hand to carrier, confirm delivery /
+pickup, settle) sit under discreet "demo controls" disclosures so the full
+backend flow stays demonstrable from the shop. State is in-memory —
+restarting the backend resets the demo (re-seed with `POST /api/seed` or
+`--seed`).
 
 ## Usage
 
@@ -229,8 +233,9 @@ infra/                     blocks.py, clock.py, event_bus.py, repositories.py,
 api/                       CQRS HTTP layer (stdlib only): server.py (routes),
                            command_adapter.py (JSON → Command), queries.py
                            (read-models), serializers.py, seed.py (demo data)
-web/                       React + Vite demo frontend (commands vs queries split
-                           in src/cqrs/); proxies /api to the backend in dev
+web/                       Northloop storefront (React + Vite + Tailwind):
+                           catalog, cart drawer, orders, returns,
+                           live activity; proxies /api to backend in dev
 tests/                     test_aggregates, test_happy_path, test_returns,
                            test_commands, test_infra_blocks, test_api, conftest
 pytest.ini / .gitignore
@@ -314,17 +319,18 @@ Stand $29.99) with stock, plus coupons `SAVE20` (20% off), `FLAT5` ($5 off),
 
 ### Frontend (`web/`)
 
-React 18 + Vite. `src/cqrs/` mirrors the backend split: `commands.js` (all
+React 18 + Vite + Tailwind CSS. `src/cqrs/` mirrors the backend split: `commands.js` (all
 mutations as dispatched intents) vs `queries.js` (all reads as GETs,
-re-fetched after each command). Vite proxies `/api` → `127.0.0.1:8000` in
+re-fetched after each command, plus a 3s poll). Vite proxies `/api` → `127.0.0.1:8000` in
 dev (`npm run dev`, :5173); `npm run build` produces a static `dist/`.
 
-| Tab | Demonstrates |
+| Surface | Demonstrates |
 |---|---|
-| **Shop** | catalog query → `OpenCart` → `AddToCart` → `ApplyCoupon` → live quote → `PlaceOrder` (authorize, not capture) |
-| **Orders** | order read-models + payment status; `HandToCarrier` (commit + capture), `ConfirmDelivery` (opens return window), `CancelOrder` (void + release, pre-shipment only) |
-| **Returns** | `RequestReturn` (Delivered-only picklist) → `SchedulePickup` → `ConfirmPickup` (scan + photo) → `SettleReturn` with goods/tax/shipping breakdown |
-| **Events** | committed event stream, polls every 3s — the Notification-context view |
+| **Hero + catalog** | dashboard/stock read-models, live stats, search/sort; `OpenCart` (auto) → `AddToCart` |
+| **Cart drawer** | cart read-model + derived quote; `UpdateCartLine`/`RemoveCoupon`/`ApplyCoupon`/`PlaceOrder` (authorize, not capture) with address form |
+| **My orders** | order/payment/shipment read-models, delivery timeline; `CancelOrder`; inline `RequestReturn`; "store demo controls" for `HandToCarrier` (commit + capture) and `ConfirmDelivery` |
+| **Returns** | RMA/pickup read-models, pickup timeline, pro-rata settlement breakdown; `SchedulePickup`; "courier demo controls" for `ConfirmPickup` (scan + photo) and `SettleReturn` |
+| **Live activity** | committed event stream (`GET /api/events`, polls every 3s) — the Notification-context view |
 
 ## Assumptions (v1 locked)
 
